@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+dist/
+build/
+*.spec
+
+# local runtime data
+inventory.db
+
+# optional future env files
+.env
