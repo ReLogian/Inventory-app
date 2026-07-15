@@ -1,6 +1,6 @@
 import csv
 import tkinter as tk
-from datetime import datetime
+from datetime import datetime, timedelta
 from tkinter import ttk, messagebox, filedialog
 import sqlite3
 import os
@@ -10,6 +10,25 @@ os.chdir(os.path.dirname(os.path.abspath(sys.argv[0])))
 
 
 class InventoryApp:
+    CATEGORY_FILTER_ALL = "Visos kategorijos"
+    COMMON_CATEGORIES = (
+        "Apsauginis stiklas",
+        "Apsaugine plevele",
+        "Atminties kortele",
+        "Ausines",
+        "Baterija",
+        "Deklas",
+        "Garso koloneles",
+        "Ikroviklis",
+        "Kamera",
+        "Laidas",
+        "Laikiklis",
+        "Laikrodis",
+        "Moduliatorius",
+        "Power bank",
+        "USB atmintukas",
+    )
+
     def __init__(self, root):
         self.root = root
         self.root.title("Inventorius")
@@ -34,7 +53,7 @@ class InventoryApp:
         self.barcode = self._entry(top, "Barcode", 0)
         self.name = self._entry(top, "Name", 1)
         self.brand = self._entry(top, "Brand", 2)
-        self.category = self._entry(top, "Category", 3)
+        self.category = self._category_combobox(top, "Category", 3)
         self.price = self._entry(top, "Price", 4)
 
         for col in range(5):
@@ -54,6 +73,7 @@ class InventoryApp:
         ttk.Button(btns, text="Eksportuoti CSV", command=self.export_csv).pack(side=tk.RIGHT, padx=(6, 0))
         ttk.Button(btns, text="Importuoti CSV", command=self.import_csv).pack(side=tk.RIGHT, padx=6)
         ttk.Button(btns, text="Mėnesio suvestinė", command=self.show_monthly_summary).pack(side=tk.RIGHT, padx=6)
+        ttk.Button(btns, text="Dienos suvestinė", command=self.show_daily_summary).pack(side=tk.RIGHT, padx=6)
 
         # ---------------- SEARCH ----------------
         search_frame = ttk.LabelFrame(root, text="Paieška", padding=10)
@@ -62,6 +82,16 @@ class InventoryApp:
         ttk.Label(search_frame, text="Ieškoti").pack(side=tk.LEFT)
         self.search_query = ttk.Entry(search_frame)
         self.search_query.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        ttk.Label(search_frame, text="Kategorija").pack(side=tk.LEFT, padx=(8, 0))
+        self.category_filter_var = tk.StringVar(value=self.CATEGORY_FILTER_ALL)
+        self.category_filter = ttk.Combobox(
+            search_frame,
+            textvariable=self.category_filter_var,
+            state="readonly",
+            width=22
+        )
+        self.category_filter.pack(side=tk.LEFT, padx=8)
+        self.category_filter.bind("<<ComboboxSelected>>", lambda e: self.search())
         ttk.Button(search_frame, text="Paieška", command=self.search).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(search_frame, text="Valyti", command=self.clear_search).pack(side=tk.LEFT)
 
@@ -96,6 +126,7 @@ class InventoryApp:
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
         self.root.bind("<Return>", lambda e: self.search())
 
+        self.refresh_categories()
         self.load_inventory()
 
     # ---------------- DB ----------------
@@ -138,6 +169,34 @@ class InventoryApp:
         e = ttk.Entry(parent, width=18)
         e.grid(row=1, column=col, padx=5, pady=(4, 0), sticky="ew")
         return e
+
+    def _category_combobox(self, parent, label, col):
+        ttk.Label(parent, text=label).grid(row=0, column=col)
+        combo = ttk.Combobox(parent, width=18, values=self.COMMON_CATEGORIES)
+        combo.grid(row=1, column=col, padx=5, pady=(4, 0), sticky="ew")
+        return combo
+
+    def get_category_value(self):
+        return self.category.get().strip()
+
+    def refresh_categories(self):
+        self.cur.execute("""
+        SELECT DISTINCT category
+        FROM products
+        WHERE category IS NOT NULL AND TRIM(category) != ''
+        ORDER BY category
+        """)
+        db_categories = [row[0] for row in self.cur.fetchall()]
+        categories = sorted(set(self.COMMON_CATEGORIES).union(db_categories), key=str.lower)
+        self.category.configure(values=categories)
+
+        selected_filter = self.category_filter_var.get()
+        filter_values = [self.CATEGORY_FILTER_ALL] + categories
+        self.category_filter.configure(values=filter_values)
+        if selected_filter in filter_values:
+            self.category_filter_var.set(selected_filter)
+        else:
+            self.category_filter_var.set(self.CATEGORY_FILTER_ALL)
 
     def clear_inputs(self):
         self.barcode.delete(0, tk.END)
@@ -204,8 +263,10 @@ class InventoryApp:
         self.selected_product_id = res[0] if res else None
 
     # ---------------- LOAD ----------------
-    def load_inventory(self):
-        self.search_query.delete(0, tk.END)
+    def load_inventory(self, clear_filters=True):
+        if clear_filters:
+            self.search_query.delete(0, tk.END)
+            self.category_filter_var.set(self.CATEGORY_FILTER_ALL)
         self.tree.delete(*self.tree.get_children())
 
         self.cur.execute("""
@@ -265,7 +326,7 @@ class InventoryApp:
             self.cur.execute("""
             INSERT INTO products (barcode, name, brand, category, price)
             VALUES (?, ?, ?, ?, ?)
-            """, (barcode, self.name.get(), self.brand.get(), self.category.get(), price))
+            """, (barcode, self.name.get(), self.brand.get(), self.get_category_value(), price))
             product_id = self.cur.lastrowid
         else:
             product_id = product[0]
@@ -283,6 +344,7 @@ class InventoryApp:
         """, (product_id,))
 
         self.conn.commit()
+        self.refresh_categories()
         self.load_inventory()
         self.clear_inputs()
 
@@ -348,7 +410,7 @@ class InventoryApp:
                 barcode,
                 self.name.get().strip(),
                 self.brand.get().strip(),
-                self.category.get().strip(),
+                self.get_category_value(),
                 price,
                 self.selected_product_id
             ))
@@ -357,6 +419,7 @@ class InventoryApp:
             return
 
         self.conn.commit()
+        self.refresh_categories()
         self.load_inventory()
         self.clear_inputs()
         self.selected_product_id = None
@@ -376,39 +439,55 @@ class InventoryApp:
 
         self.conn.commit()
         self.selected_product_id = None
+        self.refresh_categories()
         self.load_inventory()
         self.clear_inputs()
 
     # ---------------- SEARCH ----------------
     def search(self):
         query = self.search_query.get().strip()
+        category = self.category_filter_var.get().strip()
 
         self.tree.delete(*self.tree.get_children())
 
-        if not query:
-            self.load_inventory()
+        if not query and category == self.CATEGORY_FILTER_ALL:
+            self.load_inventory(clear_filters=False)
             return
 
-        like = f"%{query}%"
+        clauses = []
+        params = []
+
+        if query:
+            like = f"%{query}%"
+            clauses.append("""
+            (
+                p.barcode LIKE ?
+                OR p.name LIKE ?
+                OR p.brand LIKE ?
+                OR p.category LIKE ?
+            )
+            """)
+            params.extend((like, like, like, like))
+
+        if category != self.CATEGORY_FILTER_ALL:
+            clauses.append("p.category = ?")
+            params.append(category)
 
         self.cur.execute("""
         SELECT p.barcode, p.name, p.brand, p.category, p.price, i.quantity
         FROM products p
         LEFT JOIN inventory i ON p.id = i.product_id
-        WHERE
-            p.barcode LIKE ?
-            OR p.name LIKE ?
-            OR p.brand LIKE ?
-            OR p.category LIKE ?
+        WHERE """ + " AND ".join(clauses) + """
         ORDER BY p.name
-        """, (like, like, like, like))
+        """, params)
 
         for row in self.cur.fetchall():
             self.tree.insert("", tk.END, values=self.format_inventory_row(row))
 
     def clear_search(self):
         self.search_query.delete(0, tk.END)
-        self.load_inventory()
+        self.category_filter_var.set(self.CATEGORY_FILTER_ALL)
+        self.load_inventory(clear_filters=False)
 
     # ---------------- CSV ----------------
     def export_csv(self):
@@ -515,15 +594,36 @@ class InventoryApp:
             return
 
         self.conn.commit()
+        self.refresh_categories()
         self.load_inventory()
         messagebox.showinfo("Importas", f"Importuota: {imported}\nPraleista: {skipped}")
 
     # ---------------- SUMMARY ----------------
+    def show_daily_summary(self):
+        now = datetime.now()
+        day_start = now.strftime("%Y-%m-%d 00:00:00")
+        day_end = (datetime(now.year, now.month, now.day) + timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
+        self.show_sales_summary(
+            "Dienos suvestinė",
+            f"{now.strftime('%Y-%m-%d')} pardavimai",
+            day_start,
+            day_end,
+            "Pardavimų šiandien nėra"
+        )
+
     def show_monthly_summary(self):
         now = datetime.now()
         month_start = now.strftime("%Y-%m-01")
         next_month = f"{now.year + (1 if now.month == 12 else 0):04d}-{1 if now.month == 12 else now.month + 1:02d}-01"
+        self.show_sales_summary(
+            "Mėnesio suvestinė",
+            f"{now.strftime('%Y-%m')} pardavimai",
+            month_start,
+            next_month,
+            "Pardavimų šį mėnesį nėra"
+        )
 
+    def show_sales_summary(self, title, label, start_date, end_date, empty_message):
         self.cur.execute("""
         SELECT
             COALESCE(p.name, s.barcode) AS product_name,
@@ -535,14 +635,14 @@ class InventoryApp:
         WHERE s.created_at >= ? AND s.created_at < ?
         GROUP BY s.product_id, s.barcode
         ORDER BY revenue DESC
-        """, (month_start, next_month))
+        """, (start_date, end_date))
         rows = self.cur.fetchall()
 
         total_quantity = sum(row[2] or 0 for row in rows)
         total_revenue = sum(row[3] or 0 for row in rows)
 
         win = tk.Toplevel(self.root)
-        win.title("Mėnesio suvestinė")
+        win.title(title)
         win.geometry("700x420")
         win.transient(self.root)
 
@@ -550,7 +650,7 @@ class InventoryApp:
         header.pack(fill=tk.X)
         ttk.Label(
             header,
-            text=f"{now.strftime('%Y-%m')} pardavimai: {total_quantity} vnt. / {self.format_price(total_revenue)}"
+            text=f"{label}: {total_quantity} vnt. / {self.format_price(total_revenue)}"
         ).pack(side=tk.LEFT)
 
         cols = ("name", "barcode", "quantity", "revenue")
@@ -571,7 +671,7 @@ class InventoryApp:
             tree.insert("", tk.END, values=(name or "", barcode, quantity or 0, self.format_price(revenue)))
 
         if not rows:
-            tree.insert("", tk.END, values=("Pardavimų šį mėnesį nėra", "", 0, self.format_price(0)))
+            tree.insert("", tk.END, values=(empty_message, "", 0, self.format_price(0)))
 
 
 if __name__ == "__main__":
