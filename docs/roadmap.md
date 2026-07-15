@@ -3,17 +3,19 @@
 ## Current
 - Add / remove stock
 - Product database (SQLite)
-- Basic search (need to fix searching by other fields than barcode)
+- Search by barcode, name, brand, or category
 - Sorting table view
 - Edit / delete products
-
----
-
-## Near future
 - UI polish (spacing, layout improvements)
 - Add pop-ups for invalid formats etc
 - Export / import from csv
 - Monthly summary
+
+---
+
+## Near future
+- Choose month for historical summaries
+- Export monthly summaries
 
 ---
 
@@ -28,6 +30,5 @@
 
 ## Nice to haves (if possible)
 - Integrate with ASPA cash register
-
 
 
