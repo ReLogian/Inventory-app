@@ -1,1 +1,2 @@
-tk
+# No pip dependencies.
+# Tkinter, sqlite3, csv, and the other imports are included with Python.

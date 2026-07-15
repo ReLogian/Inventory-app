@@ -4,76 +4,206 @@ from datetime import datetime, timedelta
 from tkinter import ttk, messagebox, filedialog
 import sqlite3
 import os
+import subprocess
 import sys
+import threading
+from pathlib import Path
 
-os.chdir(os.path.dirname(os.path.abspath(sys.argv[0])))
+APP_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = APP_DIR.parent
+DB_PATH = APP_DIR / "inventory.db"
+
+os.chdir(APP_DIR)
+
+CATEGORY_FILTER_ALL = "Visos kategorijos"
+COMMON_CATEGORIES = (
+    "Apsauginis stiklas",
+    "Apsaugine plevele",
+    "Atminties kortele",
+    "Ausines",
+    "Baterija",
+    "Deklas",
+    "Garso koloneles",
+    "Ikroviklis",
+    "Kamera",
+    "Laidas",
+    "Laikiklis",
+    "Laikrodis",
+    "Moduliatorius",
+    "Power bank",
+    "USB atmintukas",
+)
+
+
+def create_schema(conn):
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        barcode TEXT UNIQUE,
+        name TEXT,
+        brand TEXT,
+        category TEXT,
+        price REAL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS inventory (
+        product_id INTEGER PRIMARY KEY,
+        quantity INTEGER DEFAULT 0,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS sales (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER,
+        barcode TEXT,
+        quantity INTEGER,
+        sold_price REAL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    conn.commit()
+
+
+def fetch_categories(cur):
+    cur.execute("""
+    SELECT DISTINCT category
+    FROM products
+    WHERE category IS NOT NULL AND TRIM(category) != ''
+    ORDER BY category
+    """)
+    return [row[0] for row in cur.fetchall()]
+
+
+def fetch_inventory_rows(cur):
+    cur.execute("""
+    SELECT p.barcode, p.name, p.brand, p.category, p.price, i.quantity
+    FROM products p
+    LEFT JOIN inventory i ON p.id = i.product_id
+    ORDER BY p.name
+    """)
+    return cur.fetchall()
+
+
+def fetch_filtered_inventory_rows(cur, query="", category=CATEGORY_FILTER_ALL):
+    clauses = []
+    params = []
+
+    if query:
+        like = f"%{query}%"
+        clauses.append("""
+        (
+            p.barcode LIKE ?
+            OR p.name LIKE ?
+            OR p.brand LIKE ?
+            OR p.category LIKE ?
+        )
+        """)
+        params.extend((like, like, like, like))
+
+    if category and category != CATEGORY_FILTER_ALL:
+        clauses.append("p.category = ?")
+        params.append(category)
+
+    sql = """
+    SELECT p.barcode, p.name, p.brand, p.category, p.price, i.quantity
+    FROM products p
+    LEFT JOIN inventory i ON p.id = i.product_id
+    """
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY p.name"
+
+    cur.execute(sql, params)
+    return cur.fetchall()
+
+
+def fetch_sales_summary_rows(cur, start_date, end_date):
+    cur.execute("""
+    SELECT
+        COALESCE(p.name, s.barcode) AS product_name,
+        s.barcode,
+        SUM(s.quantity) AS sold_qty,
+        SUM(s.quantity * s.sold_price) AS revenue
+    FROM sales s
+    LEFT JOIN products p ON p.id = s.product_id
+    WHERE s.created_at >= ? AND s.created_at < ?
+    GROUP BY s.product_id, s.barcode
+    ORDER BY revenue DESC
+    """, (start_date, end_date))
+    return cur.fetchall()
 
 
 class InventoryApp:
-    CATEGORY_FILTER_ALL = "Visos kategorijos"
-    COMMON_CATEGORIES = (
-        "Apsauginis stiklas",
-        "Apsaugine plevele",
-        "Atminties kortele",
-        "Ausines",
-        "Baterija",
-        "Deklas",
-        "Garso koloneles",
-        "Ikroviklis",
-        "Kamera",
-        "Laidas",
-        "Laikiklis",
-        "Laikrodis",
-        "Moduliatorius",
-        "Power bank",
-        "USB atmintukas",
-    )
+    CATEGORY_FILTER_ALL = CATEGORY_FILTER_ALL
+    COMMON_CATEGORIES = COMMON_CATEGORIES
 
     def __init__(self, root):
         self.root = root
         self.root.title("Inventorius")
         self.root.geometry("1150x700")
         self.root.minsize(950, 600)
+        self.set_window_icon()
 
         # ---------------- DB ----------------
-        self.conn = sqlite3.connect("inventory.db")
+        self.conn = sqlite3.connect(DB_PATH)
         self.cur = self.conn.cursor()
         self.create_tables()
 
         self.selected_product_id = None
-        self.sort_state = {"col": None, "reverse": False}
 
         style = ttk.Style()
         style.configure("Treeview", rowheight=26)
 
         # ---------------- INPUTS ----------------
-        top = ttk.LabelFrame(root, text="Prekės informacija", padding=10)
-        top.pack(fill=tk.X, padx=12, pady=(12, 6))
+        self.top = ttk.LabelFrame(root, text="Prekės informacija", padding=10)
+        self.top_visible = True
+        self.top_pack_options = {"fill": tk.X, "padx": 12, "pady": (12, 6)}
+        self.top.pack(**self.top_pack_options)
 
-        self.barcode = self._entry(top, "Barcode", 0)
-        self.name = self._entry(top, "Name", 1)
-        self.brand = self._entry(top, "Brand", 2)
-        self.category = self._category_combobox(top, "Category", 3)
-        self.price = self._entry(top, "Price", 4)
+        self.barcode = self._entry(self.top, "Barcode", 0)
+        self.name = self._entry(self.top, "Name", 1)
+        self.brand = self._entry(self.top, "Brand", 2)
+        self.category = self._category_combobox(self.top, "Category", 3)
+        self.price = self._entry(self.top, "Price", 4)
+        ttk.Button(self.top, text="▼", width=3, command=self.hide_product_form).grid(
+            row=1, column=5, padx=(8, 0), pady=(4, 0)
+        )
 
-        for col in range(5):
-            top.columnconfigure(col, weight=1)
+        for col in range(6):
+            self.top.columnconfigure(col, weight=1)
 
-        self.barcode.focus_set()
+        self.hide_product_form()
 
         # ---------------- BUTTONS ----------------
-        btns = ttk.Frame(root)
-        btns.pack(fill=tk.X, padx=12, pady=6)
+        self.buttons_frame = ttk.Frame(root)
+        self.buttons_frame.pack(fill=tk.X, padx=12, pady=6)
 
-        ttk.Button(btns, text="Pridėti", command=self.add_stock).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(btns, text="Atimti", command=self.remove_stock).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btns, text="Redaguoti", command=self.edit_product).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btns, text="Ištrinti", command=self.delete_product).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btns, text="Atnaujinti", command=self.load_inventory).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btns, text="Eksportuoti CSV", command=self.export_csv).pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(btns, text="Importuoti CSV", command=self.import_csv).pack(side=tk.RIGHT, padx=6)
-        ttk.Button(btns, text="Mėnesio suvestinė", command=self.show_monthly_summary).pack(side=tk.RIGHT, padx=6)
-        ttk.Button(btns, text="Dienos suvestinė", command=self.show_daily_summary).pack(side=tk.RIGHT, padx=6)
+        ttk.Button(self.buttons_frame, text="Pridėti", command=self.add_stock).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(self.buttons_frame, text="Atimti", command=self.remove_stock).pack(side=tk.LEFT, padx=6)
+        ttk.Button(self.buttons_frame, text="Redaguoti", command=self.edit_product).pack(side=tk.LEFT, padx=6)
+        ttk.Button(self.buttons_frame, text="Ištrinti", command=self.delete_product).pack(side=tk.LEFT, padx=6)
+        ttk.Button(self.buttons_frame, text="Atnaujinti", command=self.load_inventory).pack(side=tk.LEFT, padx=6)
+        ttk.Button(
+            self.buttons_frame,
+            text="Eksportuoti CSV",
+            command=self.export_csv
+        ).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(self.buttons_frame, text="Importuoti CSV", command=self.import_csv).pack(side=tk.RIGHT, padx=6)
+        ttk.Button(
+            self.buttons_frame,
+            text="Mėnesio suvestinė",
+            command=self.show_monthly_summary
+        ).pack(side=tk.RIGHT, padx=6)
+        ttk.Button(
+            self.buttons_frame,
+            text="Dienos suvestinė",
+            command=self.show_daily_summary
+        ).pack(side=tk.RIGHT, padx=6)
 
         # ---------------- SEARCH ----------------
         search_frame = ttk.LabelFrame(root, text="Paieška", padding=10)
@@ -128,40 +258,11 @@ class InventoryApp:
 
         self.refresh_categories()
         self.load_inventory()
+        self.root.after(1000, self.check_for_updates)
 
     # ---------------- DB ----------------
     def create_tables(self):
-        self.cur.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            barcode TEXT UNIQUE,
-            name TEXT,
-            brand TEXT,
-            category TEXT,
-            price REAL
-        )
-        """)
-
-        self.cur.execute("""
-        CREATE TABLE IF NOT EXISTS inventory (
-            product_id INTEGER PRIMARY KEY,
-            quantity INTEGER DEFAULT 0,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """)
-
-        self.cur.execute("""
-        CREATE TABLE IF NOT EXISTS sales (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id INTEGER,
-            barcode TEXT,
-            quantity INTEGER,
-            sold_price REAL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """)
-
-        self.conn.commit()
+        create_schema(self.conn)
 
     # ---------------- HELPERS ----------------
     def _entry(self, parent, label, col):
@@ -179,14 +280,142 @@ class InventoryApp:
     def get_category_value(self):
         return self.category.get().strip()
 
+    def set_window_icon(self):
+        ico_candidates = (
+            APP_DIR / "app.ico",
+            APP_DIR / "assets" / "app.ico",
+            PROJECT_DIR / "app.ico",
+        )
+        for path in ico_candidates:
+            if path.exists():
+                try:
+                    self.root.iconbitmap(str(path))
+                except tk.TclError:
+                    try:
+                        icon = tk.PhotoImage(file=str(path))
+                        self.root.iconphoto(True, icon)
+                        self.window_icon = icon
+                    except tk.TclError:
+                        pass
+                    else:
+                        return
+                else:
+                    return
+
+        png_candidates = (
+            APP_DIR / "app.png",
+            APP_DIR / "assets" / "app.png",
+            PROJECT_DIR / "app.png",
+        )
+        for path in png_candidates:
+            if path.exists():
+                try:
+                    icon = tk.PhotoImage(file=str(path))
+                    self.root.iconphoto(True, icon)
+                    self.window_icon = icon
+                except tk.TclError:
+                    pass
+                else:
+                    return
+
+    def show_product_form(self):
+        if not self.top_visible:
+            self.top.pack(**self.top_pack_options, before=self.buttons_frame)
+            self.top_visible = True
+        self.barcode.focus_set()
+
+    def hide_product_form(self):
+        if self.top_visible:
+            self.top.pack_forget()
+            self.top_visible = False
+
+    def check_for_updates(self):
+        thread = threading.Thread(target=self._check_for_updates_worker, daemon=True)
+        thread.start()
+
+    def _run_git(self, *args):
+        git_executable = self.find_git_executable()
+        if not git_executable:
+            raise FileNotFoundError("Git executable not found")
+
+        startupinfo = None
+        if sys.platform.startswith("win"):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+        return subprocess.run(
+            (git_executable, *args),
+            cwd=PROJECT_DIR,
+            text=True,
+            capture_output=True,
+            startupinfo=startupinfo,
+            check=False
+        )
+
+    def find_git_executable(self):
+        windows_candidates = (
+            PROJECT_DIR / "PortableGit" / "cmd" / "git.exe",
+            PROJECT_DIR / "Git" / "cmd" / "git.exe",
+            APP_DIR / "PortableGit" / "cmd" / "git.exe",
+            APP_DIR / "Git" / "cmd" / "git.exe",
+        )
+        for path in windows_candidates:
+            if path.exists():
+                return str(path)
+        return "git"
+
+    def _check_for_updates_worker(self):
+        try:
+            inside_repo = self._run_git("rev-parse", "--is-inside-work-tree")
+            if inside_repo.returncode != 0 or inside_repo.stdout.strip() != "true":
+                return
+
+            upstream = self._run_git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+            if upstream.returncode != 0:
+                return
+
+            if self._run_git("fetch", "--quiet").returncode != 0:
+                return
+
+            behind = self._run_git("rev-list", "--count", "HEAD..@{u}")
+            if behind.returncode != 0:
+                return
+
+            commits_behind = int(behind.stdout.strip() or "0")
+            if commits_behind > 0:
+                self.root.after(0, lambda: self.prompt_update(commits_behind))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return
+
+    def prompt_update(self, commits_behind):
+        should_update = messagebox.askyesno(
+            "Nauja versija",
+            f"Yra nauja versija ({commits_behind} pakeitimai). Atnaujinti dabar?"
+        )
+        if not should_update:
+            return
+
+        thread = threading.Thread(target=self._pull_updates_worker, daemon=True)
+        thread.start()
+
+    def _pull_updates_worker(self):
+        result = self._run_git("pull", "--ff-only")
+        self.root.after(0, lambda: self.show_update_result(result.returncode, result.stderr.strip()))
+
+    def show_update_result(self, returncode, error):
+        if returncode == 0:
+            messagebox.showinfo(
+                "Atnaujinta",
+                "Programa atnaujinta. Uždarykite ir paleiskite iš naujo, kad įsijungtų nauja versija."
+            )
+        else:
+            messagebox.showerror(
+                "Atnaujinti nepavyko",
+                error or "Nepavyko atnaujinti programos iš Git."
+            )
+
     def refresh_categories(self):
-        self.cur.execute("""
-        SELECT DISTINCT category
-        FROM products
-        WHERE category IS NOT NULL AND TRIM(category) != ''
-        ORDER BY category
-        """)
-        db_categories = [row[0] for row in self.cur.fetchall()]
+        db_categories = fetch_categories(self.cur)
         categories = sorted(set(self.COMMON_CATEGORIES).union(db_categories), key=str.lower)
         self.category.configure(values=categories)
 
@@ -248,6 +477,7 @@ class InventoryApp:
         if not selected:
             return
 
+        self.show_product_form()
         values = self.tree.item(selected[0], "values")
 
         self.clear_inputs()
@@ -269,14 +499,7 @@ class InventoryApp:
             self.category_filter_var.set(self.CATEGORY_FILTER_ALL)
         self.tree.delete(*self.tree.get_children())
 
-        self.cur.execute("""
-        SELECT p.barcode, p.name, p.brand, p.category, p.price, i.quantity
-        FROM products p
-        LEFT JOIN inventory i ON p.id = i.product_id
-        ORDER BY p.name
-        """)
-
-        for row in self.cur.fetchall():
+        for row in fetch_inventory_rows(self.cur):
             self.tree.insert("", tk.END, values=self.format_inventory_row(row))
 
     def format_inventory_row(self, row):
@@ -311,6 +534,10 @@ class InventoryApp:
 
     # ---------------- ADD ----------------
     def add_stock(self):
+        if not self.top_visible:
+            self.show_product_form()
+            return
+
         barcode = self.require_barcode()
         if not barcode:
             return
@@ -347,6 +574,7 @@ class InventoryApp:
         self.refresh_categories()
         self.load_inventory()
         self.clear_inputs()
+        self.hide_product_form()
 
     # ---------------- REMOVE ----------------
     def remove_stock(self):
@@ -386,6 +614,7 @@ class InventoryApp:
         self.conn.commit()
         self.load_inventory()
         self.clear_inputs()
+        self.hide_product_form()
 
     # ---------------- EDIT ----------------
     def edit_product(self):
@@ -423,6 +652,7 @@ class InventoryApp:
         self.load_inventory()
         self.clear_inputs()
         self.selected_product_id = None
+        self.hide_product_form()
 
     # ---------------- DELETE ----------------
     def delete_product(self):
@@ -442,6 +672,7 @@ class InventoryApp:
         self.refresh_categories()
         self.load_inventory()
         self.clear_inputs()
+        self.hide_product_form()
 
     # ---------------- SEARCH ----------------
     def search(self):
@@ -454,34 +685,7 @@ class InventoryApp:
             self.load_inventory(clear_filters=False)
             return
 
-        clauses = []
-        params = []
-
-        if query:
-            like = f"%{query}%"
-            clauses.append("""
-            (
-                p.barcode LIKE ?
-                OR p.name LIKE ?
-                OR p.brand LIKE ?
-                OR p.category LIKE ?
-            )
-            """)
-            params.extend((like, like, like, like))
-
-        if category != self.CATEGORY_FILTER_ALL:
-            clauses.append("p.category = ?")
-            params.append(category)
-
-        self.cur.execute("""
-        SELECT p.barcode, p.name, p.brand, p.category, p.price, i.quantity
-        FROM products p
-        LEFT JOIN inventory i ON p.id = i.product_id
-        WHERE """ + " AND ".join(clauses) + """
-        ORDER BY p.name
-        """, params)
-
-        for row in self.cur.fetchall():
+        for row in fetch_filtered_inventory_rows(self.cur, query, category):
             self.tree.insert("", tk.END, values=self.format_inventory_row(row))
 
     def clear_search(self):
@@ -624,19 +828,7 @@ class InventoryApp:
         )
 
     def show_sales_summary(self, title, label, start_date, end_date, empty_message):
-        self.cur.execute("""
-        SELECT
-            COALESCE(p.name, s.barcode) AS product_name,
-            s.barcode,
-            SUM(s.quantity) AS sold_qty,
-            SUM(s.quantity * s.sold_price) AS revenue
-        FROM sales s
-        LEFT JOIN products p ON p.id = s.product_id
-        WHERE s.created_at >= ? AND s.created_at < ?
-        GROUP BY s.product_id, s.barcode
-        ORDER BY revenue DESC
-        """, (start_date, end_date))
-        rows = self.cur.fetchall()
+        rows = fetch_sales_summary_rows(self.cur, start_date, end_date)
 
         total_quantity = sum(row[2] or 0 for row in rows)
         total_revenue = sum(row[3] or 0 for row in rows)
