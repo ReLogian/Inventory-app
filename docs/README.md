@@ -5,10 +5,10 @@ Simple Python + Tkinter inventory system with SQLite backend.
 ## Features
 - Add / remove stock
 - Product management
-- Search & sorting
+- Search, category filtering & sorting
 - Edit and delete products
 - CSV import / export
-- Monthly sales summary
+- Daily and monthly sales summaries
 
 ## Run
 ```bash

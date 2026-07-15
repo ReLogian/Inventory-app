@@ -4,12 +4,13 @@
 - Add / remove stock
 - Product database (SQLite)
 - Search by barcode, name, brand, or category
+- Category dropdown filtering
 - Sorting table view
 - Edit / delete products
 - UI polish (spacing, layout improvements)
 - Add pop-ups for invalid formats etc
 - Export / import from csv
-- Monthly summary
+- Daily and monthly summaries
 
 ---
 
@@ -30,5 +31,4 @@
 
 ## Nice to haves (if possible)
 - Integrate with ASPA cash register
-
 
